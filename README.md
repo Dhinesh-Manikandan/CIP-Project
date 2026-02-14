@@ -90,7 +90,7 @@ traffic-data
 
 ---
 
-## 7️⃣ Run Kafka Producer 
+## 7️⃣ Run Kafka Producer (Inside venv)
 
 ```bash
 python .\producer\kafka_producer.py
@@ -104,7 +104,7 @@ traffic-data
 
 ---
 
-## 8️⃣ Run Flink ML Consumer (Inside Docker)
+## 8️⃣ Run Flink ML Consumer (Inside venv)
 
 ```bash
 docker exec -it jobmanager bin/flink run \
@@ -118,7 +118,7 @@ This:
 - Applies ML clustering (LOW / MEDIUM / HIGH)
 
 ---
-## 9️⃣ View Real-Time Output (TaskManager Logs)
+## 9️⃣ View Real-Time Output (TaskManager Logs) (Inside venv)
 
 ```bash
 docker logs -f taskmanager
