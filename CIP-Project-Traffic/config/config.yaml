@@ -1,0 +1,6 @@
+kafka:
+  bootstrap_servers: kafka:9092
+  topic: traffic-data
+
+flink:
+  jobmanager_url: http://jobmanager:8081

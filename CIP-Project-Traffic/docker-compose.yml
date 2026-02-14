@@ -1,0 +1,87 @@
+version: "3.8"
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # 🔥 Two listeners (external + internal)
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+  # 🔥 CREATE TOPIC WITH PARTITIONS (CRITICAL)
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+      echo '⏳ Waiting for Kafka broker...';
+      cub kafka-ready -b kafka:29092 1 20 &&
+      echo '✅ Creating Kafka topic traffic-data with 2 partitions';
+      kafka-topics.sh --bootstrap-server kafka:29092
+        --create
+        --if-not-exists
+        --topic traffic-data
+        --partitions 2
+        --replication-factor 1
+      "
+
+  jobmanager:
+    image: flink-ml:1.0
+    container_name: jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    depends_on:
+      - kafka
+    volumes:
+      - ./flink_consumer:/opt/flink/jobs
+      - ./models/rerouting_kmeans.pkl:/opt/flink/jobs/rerouting_kmeans.pkl
+      - ./flink-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-connector-kafka.jar
+      - ./kafka-clients-3.6.1.jar:/opt/flink/lib/kafka-clients.jar
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        python.executable: python
+        python.client.executable: python
+
+  taskmanager:
+    image: flink-ml:1.0
+    container_name: taskmanager
+    command: taskmanager
+    depends_on:
+      - jobmanager
+    volumes:
+      - ./flink_consumer:/opt/flink/jobs
+      - ./models/rerouting_kmeans.pkl:/opt/flink/jobs/rerouting_kmeans.pkl
+      - ./flink-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-connector-kafka.jar
+      - ./kafka-clients-3.6.1.jar:/opt/flink/lib/kafka-clients.jar
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 3
+        python.executable: python
+        python.client.executable: python
