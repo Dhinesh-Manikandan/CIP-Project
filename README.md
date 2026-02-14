@@ -5,7 +5,7 @@
 ## 1️⃣ Clone the Repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Dhinesh-Manikandan/CIP-Project.git
 cd CIP-Project-Traffic
 ```
 
