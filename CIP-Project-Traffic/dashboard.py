@@ -77,13 +77,13 @@ MANUAL_ROAD_PATH_OVERRIDES = {
         [80.20787048140261, 13.008031354461018],
         [80.20966087953093, 13.008327024428471],
         [80.21228578522663, 13.00925838251943],
-        [80.21228578522663, 13.00925838251943],
         [80.2180240898333, 13.01121202641615],
         [80.21987312587852, 13.012097718538115],
     ]],
     "sardar patel rd": [[
         [80.2224155811407, 13.011808388516169],
         [80.2237911839522, 13.011267598349232],
+        [80.22592012101751, 13.010332016695921],
         [80.22885899782416, 13.009136514102352],
         [80.23439709356565, 13.008020361783057],
     ]],
@@ -91,7 +91,10 @@ MANUAL_ROAD_PATH_OVERRIDES = {
         [80.20639666490945, 13.021442789162808],
         [80.20593734782773, 13.018782599623407],
         [80.20504423124396, 13.015774313436909],
+        [80.204789061092, 13.01497308110038],
         [80.20467422578041, 13.014643088892234],
+        [80.20401658491703, 13.01275698740642],
+        [80.20388783888787, 13.01208797409655],
     ]],
 }
 
@@ -99,7 +102,8 @@ LEVEL_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
 LOAD_SMOOTHING_ALPHA = 0.80
 HIGH_PROMOTION_STREAK = 1
 DECISION_STALE_SECONDS = 25
-REACTIVE_METRIC_ALPHA = 0.85
+REACTIVE_METRIC_ALPHA = 0.92
+IMPACT_SESSION_ALPHA = 0.60
 LOAD_LEVEL_MEDIUM_THRESHOLD = 2.35
 LOAD_LEVEL_HIGH_THRESHOLD = 2.85
 
@@ -1631,6 +1635,7 @@ def update_impact_session_state(snapshot, window_key):
             "seen_keys": set(),
             "samples": 0,
             "sums": {field: 0.0 for field in tracked_fields},
+            "ema": {},
         },
     )
 
@@ -1646,15 +1651,24 @@ def update_impact_session_state(snapshot, window_key):
         should_add = True
 
     if should_add:
+        alpha = max(0.05, min(0.98, float(IMPACT_SESSION_ALPHA)))
         for field in tracked_fields:
-            state["sums"][field] += float(snapshot.get(field, 0.0))
+            value = float(snapshot.get(field, 0.0))
+            state["sums"][field] += value
+            if field not in state["ema"]:
+                state["ema"][field] = value
+            else:
+                state["ema"][field] = (alpha * value) + ((1.0 - alpha) * float(state["ema"].get(field, value)))
         state["samples"] = int(state.get("samples", 0)) + 1
 
-    samples = max(1, int(state.get("samples", 0)))
-    averaged = {
-        field: float(state["sums"].get(field, 0.0)) / samples
-        for field in tracked_fields
-    }
+    if state.get("ema"):
+        averaged = {field: float(state["ema"].get(field, 0.0)) for field in tracked_fields}
+    else:
+        samples = max(1, int(state.get("samples", 0)))
+        averaged = {
+            field: float(state["sums"].get(field, 0.0)) / samples
+            for field in tracked_fields
+        }
     averaged["samples"] = int(state.get("samples", 0))
     return averaged
 
@@ -1993,14 +2007,32 @@ def render_dashboard(refresh_seconds, use_osm_geometry):
 
     session_reroute_coverage = max(0.0, min(1.0, session_reroute_coverage))
     street_count = max(1, len(session_state.get("street_stats", {})) or len(streets))
-    congestion_pressure = max(0.0, min(1.0, float(session_avg_high_roads) / street_count))
+    congestion_pressure = max(0.0, min(1.0, float(session_avg_high_roads) / max(1, street_count)))
 
-    avg_speed_mph_base = max(10.0, 68.0 - (avg_load * 22.0))
-    reroute_speed_boost_mph = 10.0 * session_reroute_coverage * (0.35 + (0.65 * congestion_pressure))
-    avg_speed_mph = max(10.0, min(82.0, avg_speed_mph_base + reroute_speed_boost_mph))
-    avg_speed = avg_speed_mph * 1.60934
-    avg_delay = max(1.0, (1.5 + (avg_load * 8.5)) - (reroute_speed_boost_mph * 0.18))
-    traffic_severity = min(5.0, max(1.0, avg_load * 1.5))
+    congestion_penalty = (float(avg_load) * 14.0) + (congestion_pressure * 18.0)
+    latency_penalty = min(12.0, float(session_avg_latency) * 45.0)
+    throughput_relief = min(6.0, float(session_avg_throughput) * 0.45)
+    reroute_relief = float(session_reroute_coverage) * (4.0 + (10.0 * congestion_pressure))
+
+    avg_speed = max(
+        8.0,
+        min(
+            82.0,
+            62.0 - congestion_penalty - latency_penalty + throughput_relief + reroute_relief,
+        ),
+    )
+    avg_delay = max(
+        1.0,
+        (2.0 + (float(avg_load) * 6.8) + (congestion_pressure * 9.5) + (float(session_avg_latency) * 12.0))
+        - (float(session_reroute_coverage) * (1.5 + (5.0 * congestion_pressure))),
+    )
+    traffic_severity = min(
+        5.0,
+        max(
+            1.0,
+            (float(avg_load) * 1.15) + (congestion_pressure * 2.35) + min(1.2, float(session_avg_latency) * 3.0),
+        ),
+    )
     visibility = max(1.0, 8.0 - (avg_load * 1.1))
     history_rows = st.session_state.setdefault("kpi_trend_history", [])
     history_keys = st.session_state.setdefault("kpi_trend_seen_keys", set())
@@ -2348,7 +2380,7 @@ def render_dashboard(refresh_seconds, use_osm_geometry):
     with tab_impact:
         st.subheader("With Rerouting vs Without Rerouting")
         st.caption(
-            f"Session-averaged comparison across {max(1, int(impact_session.get('samples', 0)))} window(s). "
+            f"Recency-weighted session comparison across {max(1, int(impact_session.get('samples', 0)))} window(s). "
             "Without-rerouting values are estimated from live congestion and reroute coverage."
         )
 
