@@ -22,7 +22,7 @@ Install these first:
 ## Clone Repository
 
 ```powershell
-git clone <your-repo-url>
+git clone https://github.com/Dhinesh-Manikandan/CIP-Project.git
 cd CIP-Project
 cd CIP-Project-Traffic
 ```
