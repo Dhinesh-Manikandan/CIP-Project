@@ -113,18 +113,6 @@ Open dashboard URL shown in terminal (typically):
 
 Press `Ctrl + C` in their terminals.
 
-### Stop containers
-
-```powershell
-docker compose down
-```
-
-To remove volumes too (full reset):
-
-```powershell
-docker compose down -v
-```
-
 ## Troubleshooting
 
 ### Kafka/Flink not running
