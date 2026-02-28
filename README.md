@@ -22,7 +22,7 @@ Install these first:
 ## Clone Repository
 
 ```powershell
-git clone <your-repo-url>
+git clone https://github.com/Dhinesh-Manikandan/CIP-Project.git
 cd CIP-Project
 cd CIP-Project-Traffic
 ```
@@ -112,18 +112,6 @@ Open dashboard URL shown in terminal (typically):
 ### Stop Streamlit / Producer
 
 Press `Ctrl + C` in their terminals.
-
-### Stop containers
-
-```powershell
-docker compose down
-```
-
-To remove volumes too (full reset):
-
-```powershell
-docker compose down -v
-```
 
 ## Troubleshooting
 
