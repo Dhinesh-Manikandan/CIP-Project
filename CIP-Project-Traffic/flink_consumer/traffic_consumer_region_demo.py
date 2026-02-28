@@ -508,7 +508,7 @@ def main():
 
     processed.sink_to(sink)
 
-    env.execute("Synthetic Junction Traffic → Kafka Dashboard Pipeline")
+    env.execute("Traffic ML → Kafka Dashboard Pipeline")
 
 
 if __name__ == "__main__":
