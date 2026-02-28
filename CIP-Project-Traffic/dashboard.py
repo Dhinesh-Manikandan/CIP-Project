@@ -196,7 +196,14 @@ def update_session_traffic_state(all_decision_records, metrics_records):
             "total_high_roads": 0,
             "total_unique_roads": 0,
             "throughput_sum": 0.0,
+            "processing_throughput_sum": 0.0,
             "latency_sum": 0.0,
+            "latency_p95_sum": 0.0,
+            "cpu_sum": 0.0,
+            "memory_sum": 0.0,
+            "stability_sum": 0.0,
+            "window_drop_total": 0,
+            "estimated_missed_windows_total": 0,
             "metrics_samples": 0,
             "load_sum": 0.0,
             "load_samples": 0,
@@ -266,7 +273,14 @@ def update_session_traffic_state(all_decision_records, metrics_records):
         state["total_high_roads"] += int(record.get("high_roads", 0))
         state["total_unique_roads"] += int(record.get("unique_roads", 0))
         state["throughput_sum"] += float(record.get("throughput_eps", 0.0))
+        state["processing_throughput_sum"] += float(record.get("processing_throughput_eps", 0.0))
         state["latency_sum"] += float(record.get("processing_latency_sec", 0.0))
+        state["latency_p95_sum"] += float(record.get("processing_latency_sec", 0.0))
+        state["cpu_sum"] += float(record.get("cpu_util_pct", 0.0))
+        state["memory_sum"] += float(record.get("memory_mb", 0.0))
+        state["stability_sum"] += float(record.get("stability_ratio", 0.0))
+        state["window_drop_total"] += int(record.get("window_drop_flag", 0))
+        state["estimated_missed_windows_total"] += int(record.get("estimated_missed_windows", 0))
         state["metrics_samples"] += 1
 
     latest_decision_window = latest_window_records(all_decision_records, stale_seconds=10**9)
@@ -406,15 +420,48 @@ def aggregate_latest_metrics(metrics_records):
         return None
 
     latest_window = max(grouped.keys(), key=parse_time)
-    per_subtask = grouped[latest_window].values()
+    per_subtask = list(grouped[latest_window].values())
 
     events_processed = sum(int(m.get("events_processed", 0)) for m in per_subtask)
     unique_roads = sum(int(m.get("unique_roads", 0)) for m in per_subtask)
     high_roads = sum(int(m.get("high_roads", 0)) for m in per_subtask)
     throughput_eps = sum(float(m.get("throughput_eps", 0.0)) for m in per_subtask)
+    processing_throughput_eps = sum(float(m.get("processing_throughput_eps", 0.0)) for m in per_subtask)
 
     latencies = [float(m.get("processing_latency_sec", 0.0)) for m in per_subtask]
     avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+    if latencies:
+        ordered_latencies = sorted(latencies)
+        p95_idx = max(0, min(len(ordered_latencies) - 1, int(math.ceil(0.95 * len(ordered_latencies)) - 1)))
+        p95_latency = float(ordered_latencies[p95_idx])
+    else:
+        p95_latency = 0.0
+
+    cpu_values = [float(m.get("cpu_util_pct", 0.0)) for m in per_subtask]
+    avg_cpu_util_pct = (sum(cpu_values) / len(cpu_values)) if cpu_values else 0.0
+
+    memory_values = [float(m.get("memory_mb", 0.0)) for m in per_subtask]
+    avg_memory_mb = (sum(memory_values) / len(memory_values)) if memory_values else 0.0
+
+    stability_values = [float(m.get("stability_ratio", 0.0)) for m in per_subtask]
+    avg_stability_ratio = (sum(stability_values) / len(stability_values)) if stability_values else 0.0
+
+    window_drop_count = sum(int(m.get("window_drop_flag", 0)) for m in per_subtask)
+    estimated_missed_windows = sum(int(m.get("estimated_missed_windows", 0)) for m in per_subtask)
+
+    event_counts = [int(m.get("events_processed", 0)) for m in per_subtask]
+    active_subtasks = len(event_counts)
+    if event_counts and active_subtasks > 0:
+        max_events = max(event_counts)
+        mean_events = sum(event_counts) / active_subtasks
+        variance_events = sum((count - mean_events) ** 2 for count in event_counts) / active_subtasks
+        load_imbalance_cv = math.sqrt(variance_events) / max(1e-9, mean_events)
+        speedup_estimate = events_processed / max(1, max_events)
+        parallel_efficiency = speedup_estimate / max(1, active_subtasks)
+    else:
+        load_imbalance_cv = 0.0
+        speedup_estimate = 0.0
+        parallel_efficiency = 0.0
 
     return {
         "window_end": latest_window,
@@ -422,7 +469,18 @@ def aggregate_latest_metrics(metrics_records):
         "unique_roads": unique_roads,
         "high_roads": high_roads,
         "throughput_eps": throughput_eps,
+        "processing_throughput_eps": processing_throughput_eps,
         "avg_latency": avg_latency,
+        "p95_latency": p95_latency,
+        "avg_cpu_util_pct": avg_cpu_util_pct,
+        "avg_memory_mb": avg_memory_mb,
+        "avg_stability_ratio": avg_stability_ratio,
+        "window_drop_count": window_drop_count,
+        "estimated_missed_windows": estimated_missed_windows,
+        "active_subtasks": active_subtasks,
+        "speedup_estimate": speedup_estimate,
+        "parallel_efficiency": parallel_efficiency,
+        "load_imbalance_cv": load_imbalance_cv,
     }
 
 
@@ -2005,6 +2063,25 @@ def render_dashboard(refresh_seconds, use_osm_geometry):
         session_avg_high_roads = float(session_state.get("total_high_roads", 0)) / session_windows
         session_reroute_coverage = float(session_state.get("reroute_coverage_sum", 0.0)) / max(1, int(session_state.get("reroute_coverage_samples", 0)))
 
+    session_avg_processing_throughput = float(session_state.get("processing_throughput_sum", 0.0)) / session_samples
+    session_avg_cpu_util_pct = float(session_state.get("cpu_sum", 0.0)) / session_samples
+    session_avg_memory_mb = float(session_state.get("memory_sum", 0.0)) / session_samples
+    session_avg_stability_ratio = float(session_state.get("stability_sum", 0.0)) / session_samples
+    session_window_drops = int(session_state.get("window_drop_total", 0))
+    session_estimated_missed_windows = int(session_state.get("estimated_missed_windows_total", 0))
+
+    latest_p95_latency = float(latest_metrics.get("p95_latency", 0.0)) if latest_metrics else session_avg_latency
+    latest_processing_throughput = float(latest_metrics.get("processing_throughput_eps", 0.0)) if latest_metrics else session_avg_processing_throughput
+    latest_parallel_efficiency = float(latest_metrics.get("parallel_efficiency", 0.0)) if latest_metrics else 0.0
+    latest_load_imbalance_cv = float(latest_metrics.get("load_imbalance_cv", 0.0)) if latest_metrics else 0.0
+    latest_speedup_estimate = float(latest_metrics.get("speedup_estimate", 0.0)) if latest_metrics else 0.0
+    latest_active_subtasks = int(latest_metrics.get("active_subtasks", 0)) if latest_metrics else 0
+    latest_avg_cpu_util_pct = float(latest_metrics.get("avg_cpu_util_pct", 0.0)) if latest_metrics else session_avg_cpu_util_pct
+    latest_avg_memory_mb = float(latest_metrics.get("avg_memory_mb", 0.0)) if latest_metrics else session_avg_memory_mb
+    latest_stability_ratio = float(latest_metrics.get("avg_stability_ratio", 0.0)) if latest_metrics else session_avg_stability_ratio
+    latest_window_drop_count = int(latest_metrics.get("window_drop_count", 0)) if latest_metrics else 0
+    latest_estimated_missed_windows = int(latest_metrics.get("estimated_missed_windows", 0)) if latest_metrics else 0
+
     session_reroute_coverage = max(0.0, min(1.0, session_reroute_coverage))
     street_count = max(1, len(session_state.get("street_stats", {})) or len(streets))
     congestion_pressure = max(0.0, min(1.0, float(session_avg_high_roads) / max(1, street_count)))
@@ -2092,10 +2169,16 @@ def render_dashboard(refresh_seconds, use_osm_geometry):
     st.sidebar.metric("Events Processed", str(int(session_state.get("total_events_processed", 0))))
     st.sidebar.metric("Current Throughput", f"{session_avg_throughput:.2f} ev/s")
     st.sidebar.metric("Current Latency", f"{session_avg_latency:.3f} s")
+    st.sidebar.metric("CPU (avg)", f"{latest_avg_cpu_util_pct:.1f}%")
+    st.sidebar.metric("Memory (avg)", f"{latest_avg_memory_mb:.1f} MB")
+    st.sidebar.metric("Stability", f"{(latest_stability_ratio * 100.0):.1f}%")
 
     st.sidebar.markdown("#### Parallelism")
     st.sidebar.metric("Kafka Partitions", "3")
     st.sidebar.metric("Flink Parallelism (Task Manager)", 3)
+    st.sidebar.metric("Speedup (est)", f"{latest_speedup_estimate:.2f}x")
+    st.sidebar.metric("Efficiency", f"{(latest_parallel_efficiency * 100.0):.1f}%")
+    st.sidebar.metric("Load Imbalance", f"{(latest_load_imbalance_cv * 100.0):.1f}%")
     
 
     if latest_window_key:
@@ -2123,22 +2206,23 @@ def render_dashboard(refresh_seconds, use_osm_geometry):
             font-weight: 700;
             margin-top: 4px;
         }
+        div[data-testid="stMetric"] {
+            padding: 0.3rem 0.2rem;
+        }
+        div[data-testid="stMetricLabel"] p {
+            font-size: 1.05rem;
+            font-weight: 500;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 2.05rem;
+            font-weight: 500;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown(f"**Real-Time Traffic Dashboard**  ")
-    if latest_metrics:
-        st.caption(
-            f"Last updated: {latest_metrics['window_end']} | Session avg throughput: {session_avg_throughput:.2f} ev/s | "
-            f"Session avg latency: {session_avg_latency:.3f}s"
-        )
-    else:
-        st.caption(
-            f"Session avg throughput: {session_avg_throughput:.2f} ev/s | "
-            f"Session avg latency: {session_avg_latency:.3f}s"
-        )
+    st.markdown("<h2 style='margin:0 0 0.35rem 0;'>Key Performance Indicators</h2>", unsafe_allow_html=True)
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Average Speed", f"{avg_speed:.1f} km/h")
@@ -2147,6 +2231,14 @@ def render_dashboard(refresh_seconds, use_osm_geometry):
     k4.metric("Avg High Roads", f"{session_avg_high_roads:.2f}")
     k5.metric("Throughput", f"{session_avg_throughput:.2f} ev/s")
     k6.metric("Latency", f"{session_avg_latency:.3f} s")
+
+    p1, p2, p3, p4, p5, p6 = st.columns(6)
+    p1.metric("CPU Avg", f"{latest_avg_cpu_util_pct:.1f}%")
+    p2.metric("Memory Avg", f"{latest_avg_memory_mb:.1f} MB")
+    p3.metric("Parallel Eff.", f"{(latest_parallel_efficiency * 100.0):.1f}%")
+    p4.metric("Imbalance (CV)", f"{(latest_load_imbalance_cv * 100.0):.1f}%")
+    p5.metric("Speedup (est)", f"{latest_speedup_estimate:.2f}x")
+    p6.metric("Stability", f"{(latest_stability_ratio * 100.0):.1f}%")
 
     tab_map, tab_load, tab_impact, tab_raw = st.tabs([
         "Traffic Map",

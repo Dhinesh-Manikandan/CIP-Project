@@ -5,6 +5,11 @@ import pickle
 import time
 from datetime import datetime
 
+try:
+    import resource
+except Exception:
+    resource = None
+
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import (
     KafkaSource,
@@ -94,6 +99,9 @@ class JunctionTrafficRerouting(ProcessWindowFunction):
         self.model = None
         self.model_label_map = {}
         self.model_n_features = None
+        self.started_at = time.time()
+        self.windows_processed = 0
+        self.last_window_end_epoch = None
 
         try:
             if os.path.exists(MODEL_PATH):
@@ -276,6 +284,7 @@ class JunctionTrafficRerouting(ProcessWindowFunction):
 
     def process(self, key, context, elements):
         started = time.time()
+        started_cpu = time.process_time()
         road_stats = {}
         events_processed = 0
 
@@ -359,8 +368,10 @@ class JunctionTrafficRerouting(ProcessWindowFunction):
                 alternative_details_by_road[item["street"]] = []
                 reroute_reason_by_road[item["street"]] = "Low congestion road (LOW/MEDIUM); reroute not required"
 
-        window_start = datetime.fromtimestamp(context.window().start / 1000).isoformat()
-        window_end = datetime.fromtimestamp(context.window().end / 1000).isoformat()
+        window_start_epoch = context.window().start / 1000
+        window_end_epoch = context.window().end / 1000
+        window_start = datetime.fromtimestamp(window_start_epoch).isoformat()
+        window_end = datetime.fromtimestamp(window_end_epoch).isoformat()
 
         high_roads = 0
         for item in sorted_by_load:
@@ -388,6 +399,33 @@ class JunctionTrafficRerouting(ProcessWindowFunction):
             yield json.dumps(result)
 
         latency = time.time() - started
+        cpu_time_used = time.process_time() - started_cpu
+        cpu_util_pct = (cpu_time_used / max(latency, 1e-6)) * 100.0
+
+        memory_mb = 0.0
+        if resource is not None:
+            try:
+                rss_raw = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                if rss_raw > 10_000_000:
+                    memory_mb = rss_raw / (1024.0 * 1024.0)
+                else:
+                    memory_mb = rss_raw / 1024.0
+            except Exception:
+                memory_mb = 0.0
+
+        previous_window_end = self.last_window_end_epoch
+        window_gap_sec = 0.0 if previous_window_end is None else max(0.0, float(window_end_epoch - previous_window_end))
+        self.last_window_end_epoch = float(window_end_epoch)
+        self.windows_processed += 1
+
+        uptime_sec = max(1e-6, float(time.time() - self.started_at))
+        expected_windows = max(1.0, uptime_sec / float(WINDOW_SECONDS))
+        stability_ratio = min(1.0, float(self.windows_processed) / expected_windows)
+        estimated_missed_windows = max(0, int(round(expected_windows)) - int(self.windows_processed))
+        window_drop_flag = 0
+        if previous_window_end is not None and window_gap_sec > (1.5 * float(WINDOW_SECONDS)):
+            window_drop_flag = 1
+
         metrics = {
             "record_type": "metrics",
             "subtask": self.subtask,
@@ -395,7 +433,17 @@ class JunctionTrafficRerouting(ProcessWindowFunction):
             "unique_roads": len(sorted_by_load),
             "high_roads": high_roads,
             "processing_latency_sec": round(latency, 4),
+            "processing_throughput_eps": round(events_processed / max(latency, 1e-6), 3),
             "throughput_eps": round(events_processed / WINDOW_SECONDS, 3),
+            "cpu_util_pct": round(cpu_util_pct, 3),
+            "memory_mb": round(memory_mb, 3),
+            "window_gap_sec": round(window_gap_sec, 3),
+            "window_drop_flag": int(window_drop_flag),
+            "uptime_sec": round(uptime_sec, 3),
+            "windows_processed": int(self.windows_processed),
+            "expected_windows": round(expected_windows, 3),
+            "stability_ratio": round(stability_ratio, 4),
+            "estimated_missed_windows": int(estimated_missed_windows),
             "window_start": window_start,
             "window_end": window_end,
         }
