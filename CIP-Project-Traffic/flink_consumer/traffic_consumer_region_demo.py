@@ -1,7 +1,7 @@
 import json
 import math
 import os
-import pickle
+import joblib
 import time
 from datetime import datetime
 
@@ -98,24 +98,24 @@ class JunctionTrafficRerouting(ProcessWindowFunction):
         self.smoothed_load_by_street = {}
         self.model = None
         self.model_label_map = {}
-        self.model_n_features = None
+        self.scaler = None
         self.started_at = time.time()
         self.windows_processed = 0
         self.last_window_end_epoch = None
 
         try:
             if os.path.exists(MODEL_PATH):
-                with open(MODEL_PATH, "rb") as file:
-                    self.model = pickle.load(file)
-                self.model_n_features = int(getattr(self.model, "n_features_in_", 1) or 1)
-                self.model_label_map = self._build_kmeans_label_map()
+                saved = joblib.load(MODEL_PATH)
+                self.model = saved["model"]
+                self.scaler = saved["scaler"]
+                self.model_label_map = {int(k): v for k, v in saved["cluster_labels"].items()}
                 print(f"Subtask {self.subtask}: loaded ML model from {MODEL_PATH}")
             else:
                 print(f"Subtask {self.subtask}: ML model not found at {MODEL_PATH}; using fallback rules")
         except Exception as exc:
             self.model = None
+            self.scaler = None
             self.model_label_map = {}
-            self.model_n_features = None
             print(f"Subtask {self.subtask}: ML model load failed ({type(exc).__name__}: {exc}); using fallback rules")
 
     @staticmethod
@@ -130,62 +130,23 @@ class JunctionTrafficRerouting(ProcessWindowFunction):
             return "MEDIUM"
         return "LOW"
 
-    def _build_kmeans_label_map(self):
-        if self.model is None:
-            return {}
+    def _build_features(self, raw_load, count):
+        # Replicate training feature: traffic_load = avg_severity^2 * log1p(count)
+        traffic_load = (float(raw_load) ** 2) * math.log1p(max(1, int(count)))
+        return [[traffic_load]]
 
-        centers = getattr(self.model, "cluster_centers_", None)
-        if centers is None or len(centers) == 0:
-            return {}
-
-        # Prefer smoothed load dimension if available; else first dimension.
-        load_index = 1 if len(centers[0]) > 1 else 0
-        ordered = sorted(
-            [(idx, float(center[load_index])) for idx, center in enumerate(centers)],
-            key=lambda x: x[1],
-        )
-
-        level_order = ["LOW", "MEDIUM", "HIGH"]
-        label_map = {}
-        for rank, (cluster_id, _) in enumerate(ordered):
-            mapped_level = level_order[min(rank, len(level_order) - 1)]
-            label_map[int(cluster_id)] = mapped_level
-        return label_map
-
-    def _build_features(self, raw_load, smoothed_load, lat, lon, probe_id):
-        base = [
-            float(raw_load),
-            float(smoothed_load),
-            float(lat),
-            float(lon),
-            float(probe_id),
-        ]
-
-        needed = int(self.model_n_features or 1)
-        if needed <= len(base):
-            return base[:needed]
-
-        # Pad with last known stable signal (smoothed load) if model expects more fields.
-        return base + [float(smoothed_load)] * (needed - len(base))
-
-    def predict_level(self, raw_load, smoothed_load, lat, lon, probe_id):
-        if self.model is None:
+    def predict_level(self, raw_load, smoothed_load, count):
+        if self.model is None or self.scaler is None:
             return self.classify_level(smoothed_load)
 
         try:
-            features = self._build_features(raw_load, smoothed_load, lat, lon, probe_id)
-            predicted = self.model.predict([features])[0]
-
-            if isinstance(predicted, str):
-                normalized = str(predicted).upper()
-                if normalized in {"LOW", "MEDIUM", "HIGH"}:
-                    return normalized
-
-            predicted_int = int(predicted)
+            features = self._build_features(raw_load, count)
+            scaled = self.scaler.transform(features)
+            predicted_int = int(self.model.predict(scaled)[0])
             if predicted_int in self.model_label_map:
                 return self.model_label_map[predicted_int]
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"Subtask {self.subtask}: predict failed ({exc}); using fallback")
 
         return self.classify_level(smoothed_load)
 
@@ -315,9 +276,7 @@ class JunctionTrafficRerouting(ProcessWindowFunction):
             level = self.predict_level(
                 raw_load=raw_load,
                 smoothed_load=smoothed,
-                lat=values["lat"],
-                lon=values["lon"],
-                probe_id=values["probe_id"],
+                count=values["count"],
             )
             enriched.append({
                 "street": street,
